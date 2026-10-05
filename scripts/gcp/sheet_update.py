@@ -12,9 +12,18 @@
     # 2) 表の末尾に行を追加する
     python sheet_update.py <ID または URL> --tab <タブ名> --append --values '[["a","b","c"]]' --apply
 
+    # 3) 行番号がずれていないか、書き込む前に契約名で照合する（何個でも指定できる）
+    python sheet_update.py <ID または URL> --tab <タブ名> --range Q20:Q21 \\
+        --values '[["2027/04/06"],["2027/04/06"]]' --expect C20=契約A --expect C21=契約B
+
+    # 4) 空のセルにだけ書く（すでに何か入っていたら中止する。新しい行の追加に使う）
+    python sheet_update.py <ID または URL> --tab <タブ名> --range A42:C42 --values '[[41,"","名前"]]' --only-if-empty
+
 安全のための決まり:
     - 1 行目（見出し）への書き込みは --allow-header を付けない限り拒否する
     - 範囲の大きさと値の大きさが違う場合は何もせず止まる
+    - --expect で指定したセルの中身が違う場合は、確認のみのときも含めて何もせず止まる
+    - --only-if-empty を付けると、書き込み先に何か入っている場合は何もせず止まる
     - 値は RAW（入力した文字をそのまま保存）が標準。外部から来た文字が数式として
       実行されるのを防ぐため。日付や数式として解釈させたいときだけ --user-entered を付ける
 
@@ -126,6 +135,18 @@ def parse_values(text: str) -> list[list[Any]]:
     return values
 
 
+def parse_expects(items: list[str]) -> list[tuple[str, str]]:
+    """--expect 'C20=契約名' を (セル, 期待する文字) のリストにする。"""
+    result: list[tuple[str, str]] = []
+    for item in items:
+        cell, sep, expected = item.partition("=")
+        cell = cell.strip().upper()
+        if not sep or not CELL_PATTERN.match(cell) or not expected.strip():
+            raise ValueError(f"--expect は 'C20=契約名' の形で書いてください: {item}")
+        result.append((cell, expected.strip()))
+    return result
+
+
 def show(value: Any) -> str:
     """表示用。空は（空）にする。"""
     return "（空）" if value in ("", None) else str(value)
@@ -148,6 +169,31 @@ def api_error(response: Any, creds_email: str) -> None:
     )
 
 
+def check_expectations(
+    session: Any, sheet_id: str, tab: str, expects: list[tuple[str, str]], account_email: str
+) -> None:
+    """指定セルの中身が期待どおりか確認し、違えば何も書かずに終了する。"""
+    response = session.get(
+        f"{BASE_URL}/{sheet_id}/values:batchGet",
+        params={"ranges": [f"{tab}!{cell}" for cell, _ in expects]},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        api_error(response, account_email)
+    value_ranges = response.json().get("valueRanges", [])
+    if len(value_ranges) != len(expects):
+        fail("照合用のセルを読み取れませんでした。何も書き込まずに中止しました。")
+    problems = []
+    for (cell, expected), value_range in zip(expects, value_ranges):
+        rows = value_range.get("values", [])
+        actual = str(rows[0][0]).strip() if rows and rows[0] else ""
+        if actual != expected:
+            problems.append(f"  {cell}: 「{expected}」のはずが「{show(actual)}」でした")
+    if problems:
+        fail("行がずれている可能性があるため、何も書き込まずに中止しました。\n" + "\n".join(problems))
+    print("事前照合 OK: " + "、".join(f"{c}={v}" for c, v in expects))
+
+
 def run(args: argparse.Namespace, session: Any, account_email: str = "(不明)") -> int:
     """更新の本体。session は requests.Session 互換（テストでは偽物を渡す）。"""
     try:
@@ -161,6 +207,8 @@ def run(args: argparse.Namespace, session: Any, account_email: str = "(不明)")
     mode_label = "日付・数式として解釈" if args.user_entered else "入力どおりに保存"
 
     if args.append:
+        if args.expect or args.only_if_empty:
+            fail("--expect と --only-if-empty は --range と一緒に使ってください（--append とは併用できません）。")
         a1 = f"{tab}!A1"
         url = f"{BASE_URL}/{sheet_id}/values/{quote(a1, safe='')}:append"
         print(f"対象: {args.tab} の表の末尾に {len(values)} 行を追加  [{mode_label}]")
@@ -195,6 +243,13 @@ def run(args: argparse.Namespace, session: Any, account_email: str = "(不明)")
     a1 = f"{tab}!{index_to_col(sc)}{sr}" + (f":{index_to_col(ec)}{er}" if (sc, sr) != (ec, er) else "")
     url = f"{BASE_URL}/{sheet_id}/values/{quote(a1, safe='')}"
 
+    try:
+        expects = parse_expects(args.expect)
+    except ValueError as exc:
+        fail(str(exc))
+    if expects:
+        check_expectations(session, sheet_id, tab, expects, account_email)
+
     response = session.get(url, timeout=30)
     if response.status_code != 200:
         api_error(response, account_email)
@@ -202,6 +257,16 @@ def run(args: argparse.Namespace, session: Any, account_email: str = "(不明)")
 
     def current_at(r: int, c: int) -> Any:
         return current[r][c] if r < len(current) and c < len(current[r]) else ""
+
+    if args.only_if_empty:
+        occupied = [
+            f"  {index_to_col(sc + c)}{sr + r}: {show(current_at(r, c))}"
+            for r in range(rows)
+            for c in range(cols)
+            if str(current_at(r, c)) != ""
+        ]
+        if occupied:
+            fail("書き込み先に、すでに値が入っています。何も書き込まずに中止しました。\n" + "\n".join(occupied))
 
     print(f"対象: {a1}  [{mode_label}]")
     changed = unchanged = 0
@@ -249,6 +314,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--values", required=True, help='書き込む値。行のリストの JSON。例: \'[["a","b"]]\'')
     parser.add_argument("--apply", action="store_true", help="実際に書き込む（付けなければ確認のみ）")
     parser.add_argument("--user-entered", action="store_true", help="日付や数式として解釈させる（標準は入力どおり）")
+    parser.add_argument(
+        "--expect", action="append", default=[], metavar="セル=文字",
+        help="書き込む前に、このセルの中身が一致するか確認する。例: --expect C20=契約名（何個でも指定可）",
+    )
+    parser.add_argument("--only-if-empty", action="store_true", help="書き込み先がすべて空のときだけ書き込む")
     parser.add_argument("--allow-header", action="store_true", help="1 行目（見出し）への書き込みを許可する")
     return parser
 

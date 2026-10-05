@@ -29,8 +29,10 @@ class FakeResponse:
 class FakeSession:
     """呼び出しを記録し、決められた応答を返す偽の requests.Session。"""
 
-    def __init__(self, current: list[list[str]] | None = None, status: int = 200, error: dict | None = None):
+    def __init__(self, current: list[list[str]] | None = None, status: int = 200, error: dict | None = None,
+                 cells: dict[str, str] | None = None):
         self.current = current or []
+        self.cells = cells or {}
         self.status = status
         self.error = error
         self.calls: list[tuple[str, str, dict]] = []
@@ -42,6 +44,13 @@ class FakeSession:
         self._record("GET", url, kwargs)
         if self.status != 200:
             return FakeResponse(self.status, self.error)
+        if url.endswith(":batchGet"):
+            ranges = kwargs["params"]["ranges"]
+            value_ranges = []
+            for rng in ranges:
+                value = self.cells.get(rng.split("!")[1], "")
+                value_ranges.append({"values": [[value]]} if value != "" else {})
+            return FakeResponse(200, {"valueRanges": value_ranges})
         return FakeResponse(200, {"values": self.current})
 
     def put(self, url, **kwargs):
@@ -160,3 +169,80 @@ def test_column_conversion_roundtrip():
 
 def test_url_is_accepted_as_sheet():
     assert su.extract_sheet_id(f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit#gid=0") == SHEET_ID
+
+
+# ---- --expect（契約名の照合）----
+
+def test_expect_match_allows_write(capsys):
+    session = FakeSession(cells={"C20": "契約A", "C21": "契約B"})
+    su.run(parse("--range", "Q20:Q21", "--values", '[["x"],["y"]]', "--apply",
+                 "--expect", "C20=契約A", "--expect", "C21=契約B"), session)
+    assert session.methods() == ["GET", "GET", "PUT"]
+    assert "事前照合 OK" in capsys.readouterr().out
+
+
+def test_expect_mismatch_stops_even_in_dry_run(capsys):
+    session = FakeSession(cells={"C20": "別の契約"})
+    with pytest.raises(SystemExit):
+        su.run(parse("--range", "Q20", "--values", '[["x"]]', "--expect", "C20=契約A"), session)
+    assert "PUT" not in session.methods()
+    err = capsys.readouterr().err
+    assert "契約A" in err and "別の契約" in err and "ずれている" in err
+
+
+def test_expect_on_empty_cell_is_a_mismatch(capsys):
+    session = FakeSession(cells={})
+    with pytest.raises(SystemExit):
+        su.run(parse("--range", "Q20", "--values", '[["x"]]', "--apply", "--expect", "C20=契約A"), session)
+    assert "PUT" not in session.methods()
+    assert "（空）" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["C20", "=x", "20=x", "C20="])
+def test_bad_expect_format_is_refused(bad, capsys):
+    session = FakeSession()
+    with pytest.raises(SystemExit):
+        su.run(parse("--range", "Q20", "--values", '[["x"]]', "--expect", bad), session)
+    assert session.calls == []
+
+
+def test_expect_is_not_allowed_with_append(capsys):
+    session = FakeSession()
+    with pytest.raises(SystemExit):
+        su.run(parse("--append", "--values", '[["a"]]', "--expect", "C2=x"), session)
+    assert session.calls == []
+
+
+# ---- --only-if-empty ----
+
+def test_only_if_empty_allows_empty_target(capsys):
+    session = FakeSession(current=[])
+    su.run(parse("--range", "A42:C42", "--values", '[[41,"","名前"]]', "--only-if-empty", "--apply"), session)
+    assert session.methods() == ["GET", "PUT"]
+
+
+def test_only_if_empty_refuses_occupied_target(capsys):
+    session = FakeSession(current=[["", "", "既にある契約"]])
+    with pytest.raises(SystemExit):
+        su.run(parse("--range", "A42:C42", "--values", '[[41,"","名前"]]', "--only-if-empty", "--apply"), session)
+    assert session.methods() == ["GET"]
+    err = capsys.readouterr().err
+    assert "C42" in err and "既にある契約" in err
+
+
+# ---- 新しい行を追加する場面の再現（偽の Google 相手）----
+
+def test_new_row_scenario(capsys):
+    values = '[[41,"","新規契約X","","","チャット","","","","ライト",60000,"9/15〜10/14","","","2026/10/14"]]'
+    session = FakeSession(current=[])
+    su.run(parse("--range", "A42:O42", "--values", values, "--only-if-empty", "--user-entered"), session)
+    out = capsys.readouterr().out
+    assert session.methods() == ["GET"]
+    assert "変更 7 セル、変更なし 8 セル" in out
+    for expected in ["A42: （空）  →  41", "C42: （空）  →  新規契約X", "J42: （空）  →  ライト",
+                     "K42: （空）  →  60000", "L42: （空）  →  9/15〜10/14", "O42: （空）  →  2026/10/14"]:
+        assert expected in out
+    su.run(parse("--range", "A42:O42", "--values", values, "--only-if-empty", "--user-entered", "--apply"), session)
+    body = session.calls[-1][2]["json"]["values"][0]
+    assert len(body) == 15 and body[0] == 41 and body[10] == 60000 and body[14] == "2026/10/14"
+    assert session.calls[-1][2]["params"] == {"valueInputOption": "USER_ENTERED"}
