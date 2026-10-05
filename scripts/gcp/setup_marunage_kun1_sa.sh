@@ -6,7 +6,8 @@
 #
 #   1. プロジェクト marunage-kun1 を作成（既存なら再利用）
 #   2. Google Sheets API を有効化（SA 作成に必要な IAM API も併せて有効化）
-#   3. サービスアカウント kun1 を作成（ロール付与なし）
+#   3. サービスアカウント kun1-sa を作成（ロール付与なし）
+#      ※ Google の仕様でアカウント名は 6〜30 文字。4 文字の "kun1" は作れないため kun1-sa を既定にしている
 #   4. JSON 鍵を ~/.config/marunage-kun1/sa-key.json に保存し、権限を 600 にする
 #   5. サービスアカウントのメールアドレスを表示
 #
@@ -18,13 +19,13 @@
 #
 # 環境変数で上書き可能:
 #   PROJECT_ID (既定: marunage-kun1)  PROJECT_NAME (既定: PROJECT_ID と同じ)
-#   SA_NAME    (既定: kun1)           KEY_DIR      (既定: ~/.config/marunage-kun1)
+#   SA_NAME    (既定: kun1-sa)        KEY_DIR      (既定: ~/.config/marunage-kun1)
 # =============================================================================
 set -euo pipefail
 
 PROJECT_ID="${PROJECT_ID:-marunage-kun1}"
 PROJECT_NAME="${PROJECT_NAME:-$PROJECT_ID}"
-SA_NAME="${SA_NAME:-kun1}"
+SA_NAME="${SA_NAME:-kun1-sa}"
 KEY_DIR="${KEY_DIR:-$HOME/.config/marunage-kun1}"
 KEY_PATH="$KEY_DIR/sa-key.json"
 SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
@@ -32,6 +33,12 @@ APIS=(sheets.googleapis.com iam.googleapis.com)
 
 log() { printf '[setup] %s\n' "$*"; }
 die() { printf '[setup] ERROR: %s\n' "$*" >&2; exit 1; }
+
+# サービスアカウント名の形式チェック（Google の仕様: 6〜30 文字、英小文字で始まり、英小文字・数字・ハイフンのみ）
+# 何かを作る前に確認して、ここで止める。
+if [[ ! "$SA_NAME" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
+  die "サービスアカウント名 '$SA_NAME' は使えません（${#SA_NAME} 文字）。6〜30 文字で、英小文字で始まり、英小文字・数字・ハイフンのみにしてください。例: SA_NAME=kun1-sa"
+fi
 
 # --- 0. 前提チェック ---------------------------------------------------------
 command -v gcloud >/dev/null 2>&1 \
