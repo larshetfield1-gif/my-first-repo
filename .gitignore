@@ -1,0 +1,11 @@
+# Google Cloud サービスアカウント鍵 — 絶対にコミットしない
+sa-key.json
+*-sa-key.json
+*service-account*.json
+*service_account*.json
+.config/
+
+# 環境変数・秘匿情報
+.env
+.env.*
+!.env.example
